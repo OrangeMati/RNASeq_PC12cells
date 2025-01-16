@@ -1,0 +1,1 @@
+to create the star index there must be an unzipped gtf and fasta genome annotation file in the folders specified in the STARrunindex.sh file from (004_Trimmoout), and the folder star_indices must be empty, then the STARrunindex.sh file can be run and the index created.
