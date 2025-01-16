@@ -1,0 +1,525 @@
+---
+title: "homework.funcAn.final"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4
+    number_sections: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    fig_caption: true
+    df_print: paged
+    keep_md: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE, message = FALSE, warning=FALSE, cache=FALSE}
+# from advanced R - chapter debugging
+# options(error = function() {
+#   sink()
+#   recover()
+# })
+knitr::opts_chunk$set(cache=TRUE, 
+                      error = FALSE, 
+                      warning = FALSE, 
+                      message = FALSE, 
+                      cache.lazy = FALSE, 
+                      autodep = TRUE # automatically check if some previous chunk changed, and it TRUE, re-cache all junks from the changed chunk
+                      )
+options(rlang_trace_top_env = rlang::current_env())
+options(error = function() {
+  sink()
+  print(rlang::trace_back(bottom = sys.frame(-1)), simplify = "none")
+})
+
+library(openxlsx)
+library(tidyverse)
+library(clusterProfiler)
+library(data.table)
+library(GSEABase)
+library(org.Mm.eg.db)
+library("ReactomePA")
+library(enrichplot)
+library(DOSE)
+library("pathview")
+library(fgsea)
+library("SPIA")
+library(readr)
+
+```
+
+# Overview
+
+In this script, we will perform functional analysis of the identified,
+differential genes.
+
+In the first part, we will do over-representation analysis (ORA).
+
+In the second part, we will do functional class scoring using gene set
+enrichement analysis (GSEA).
+
+
+```{r}
+inpDir <- paste(getwd(), "../009_DESeq2clean/all_vs_GM", sep = "/")
+
+Rat2Mouse_CHIP <- read_delim("../000_referenceseq/CHIP/Rat_Ensembl_Gene_ID_Mouse_Orthologs_MSigDB.v2023.2.Mm.chip", 
+    delim = "\t", escape_double = FALSE, 
+    trim_ws = TRUE)
+#View(Rat2Mouse_CHIP)
+
+```
+
+# Over-representation analysis (ORA)
+
+## import results of differential expression analysis
+
+```{r}
+l_df.res.all <- readRDS(paste(inpDir, "l_df.res.all.rds", sep = "/"))
+names(l_df.res.all)
+```
+
+only DM vs GM is needed (we will subset from full
+result tables)
+
+```{r}
+df_DM.vs.GM.noNa <- l_df.res.all$DM.vs.GM.noNa
+
+dim(df_DM.vs.GM.noNa)
+
+head(df_DM.vs.GM.noNa)
+```
+
+this is the number of sig. reg. genes that have a log2fc of over 1 (padj \< 0.05 & abs(log2fc) \> 1)
+
+```{r}
+nrow(df_DM.vs.GM.noNa[df_DM.vs.GM.noNa$padj < 0.05 & 
+                                 abs(df_DM.vs.GM.noNa$log2FoldChange) > 1, ])
+
+
+```
+
+## manually calculate enrichment of Reactome geneset "Hemostasis" in Y640F.vs.dsRed
+
+### download and import Reactome genesets
+
+Reactome geneset can be downloaded from here
+[linkToMsigDb](https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2023.1.Mm/m2.cp.reactome.v2023.1.Mm.symbols.gmt%5D)
+
+You need to register and login to MsigDb
+
+Download m2.cp.reactome.v2023.1.Mm.symbols.gmt in current working
+directory.
+
+Now read in and check object
+
+```{r}
+library(GSEABase)
+gmt_r <- GSEABase::getGmt(paste("/proj/courses/transcriptomics/SS23/hw/011_clusterProfiler/inputData/m2.cp.reactome.v2023.1.Mm.symbols.gmt", 
+                                sep = "/"))
+gmt_r # GeneSetCollection object
+```
+
+### convert to dataframe and merge with results from differential expression analysis
+
+The next step is to know in which genset each of the genes tested for
+differential regulation belongs to. Therefore, we generate a table, with
+two columns, one geneset, and one gene-symbol column.
+
+First convert GeneSetCollection Object into a list.
+
+```{r}
+l_gs <- geneIds(gmt_r)
+```
+
+Then convert it into a data.frame using functions from the tidyverse
+universe [tidyverse](https://www.tidyverse.org/)
+
+```{r}
+df_gsToGene <- as.data.frame(unnest(enframe(l_gs, 
+                                            name = "geneset", 
+                                            value = "symbol"), 
+                                    cols = "symbol"))
+dim(df_gsToGene)
+sum(duplicated(df_gsToGene$symbol))
+length(unique(df_gsToGene$symbol))
+head(df_gsToGene, n=4)
+```
+
+-   Many genes are present in multiple pathways, therefore, much more
+    rows than unique genes. Note that number of unique genes in Reactome
+    is far less than number of unique genes tested for differential
+    expression analysis (9045 vs. \~17500).
+
+## extract unique genes from Reactome, und use to subset result from diff.exp.analysis
+
+The genes in the Reactome database are our "universe", within we try to
+find an association between the gensets and our differentially expressed
+genes. Subset results of differentially expressed genes to genes present
+in Reactome database.
+
+```{r}
+v_gInR <- unique(df_gsToGene$symbol)
+```
+
+Before subsetting, we check if we have duplicated gene symbols in our
+result tables
+
+## next code cell orthologue maps rat genes to the mouse orthologues
+
+```{r}
+df_DM.vs.GM.noNa$symbolmouse <- Rat2Mouse_CHIP$"Gene Symbol"[match(df_DM.vs.GM.noNa$ENSEMBLEID, Rat2Mouse_CHIP$"Probe Set ID")]
+```
+
+
+```{r}
+sum(duplicated(df_DM.vs.GM.noNa$symbolmouse))
+```
+
+Show rows with duplicated gene symbols
+
+```{r}
+df_DM.vs.GM.noNa[duplicated(df_DM.vs.GM.noNa$symbolmouse) | 
+                 duplicated(df_DM.vs.GM.noNa$symbolmouse, fromLast=T), ]
+
+```
+
+We see that there are some genes with multiple Ensemble Gene Ids.
+
+We simply remove one of the duplicates randomly, to avoid problems
+later, with subsetting, merging, ...
+
+```{r}
+df_DM.vs.GM.noNa <- df_DM.vs.GM.noNa[!duplicated(df_DM.vs.GM.noNa$symbolmouse), ]
+# consistency check, should be 0 afterwards
+sum(duplicated(df_DM.vs.GM.noNa$symbolmouse))
+
+```
+
+Next, we subset the data.
+
+```{r}
+# already use mouse symbols instead of rat symbols
+df_DM.vs.GM.noNa <- df_DM.vs.GM.noNa[df_DM.vs.GM.noNa$symbolmouse %in% v_gInR, ]
+
+dim(df_DM.vs.GM.noNa)
+
+length(v_gInR)
+```
+
+Not all of the 9045 genes in the Reactome Database were expressed in our
+data. We end up with \~ 6150 genes, that were expressed, and that are in
+the Reactome database.
+
+### Add column indicating which genes are in Genset "Hemostasis" in Diff.Exp.Table
+
+These symbols belong to HEMOSTASIS pathway
+
+```{r}
+#exploration in Hemostasis pathway, not relevant for PC12 cells
+v_gHemo <- unique(df_gsToGene[grep("HEMOSTASIS", df_gsToGene$geneset), ]$symbol)
+length(v_gHemo)
+v_gccc <- unique(df_gsToGene[grep("CELL_CELL_COMMUNICATION", df_gsToGene$geneset), ]$symbol)
+v_gecm <- unique(df_gsToGene[grep("EXTRACELLULAR_MATRIX_ORGANIZATION", df_gsToGene$geneset), ]$symbol)
+v_gcc <- unique(df_gsToGene[grep("CELL_CYCLE_CHECKPOINTS", df_gsToGene$geneset), ]$symbol)
+```
+
+in diff. exp. table, indicate which genes belong to HEMOSTAIS (==1), and
+which not (==0)
+
+```{r}
+df_DM.vs.GM.noNa$isHemostasis <- ifelse(df_DM.vs.GM.noNa$symbolmouse %in% v_gHemo, 1, 0)
+df_DM.vs.GM.noNa$isCellcellcomm <- ifelse(df_DM.vs.GM.noNa$symbolmouse %in% v_gccc, 1, 0)
+df_DM.vs.GM.noNa$isECM <- ifelse(df_DM.vs.GM.noNa$symbolmouse %in% v_gecm, 1, 0)
+df_DM.vs.GM.noNa$isCellcyclecheckpoints <- ifelse(df_DM.vs.GM.noNa$symbolmouse %in% v_gcc, 1, 0)
+
+```
+
+```{r}
+table(df_DM.vs.GM.noNa$isHemostasis, useNA = "always")
+table(df_DM.vs.GM.noNa$isCellcellcomm, useNA = "always")
+table(df_DM.vs.GM.noNa$isECM, useNA = "always")
+```
+
+We see that from the 628 genes of the Hemostasis genset, only 403 are in
+the Diff.Exp.Table
+
+
+
+
+
+### Add column indicating which genes sig. diff. regulated (padj & log2FC cutoff)
+
+```{r}
+df_DM.vs.GM.noNa$isSig <- ifelse(df_DM.vs.GM.noNa$padj < 0.05 & 
+                                 abs(df_DM.vs.GM.noNa$log2FoldChange) > 1, 1, 0)
+table(df_DM.vs.GM.noNa$isSig, useNA = "always")
+```
+
+
+
+Note that because of subsetting, we only test a fraction of originally
+identified, sig. genes, for enrichtment in the pathways.
+
+### Check how the overlap between sig. genes and reactome hemostasis genset is
+
+Do it just for DM vs GM
+
+```{r}
+tab <- table(df_DM.vs.GM.noNa$isSig, 
+             df_DM.vs.GM.noNa$isHemostasis)
+tab_sum <- addmargins(tab, FUN = sum)
+tab_sum
+```
+
+In the first row we have the not sig. genes, in the second row the sig.
+genes, and in the third row we have the sum. In the first column we have
+the genes that are not in the genset, in the second column we have the
+genes that are in the genset, and in the third column we have the sum.
+
+### Now use Fisher Exact test to test for sig. enrichment of Homeostasis genes in sig. reg. genes
+
+
+```{r}
+fisher.test(tab)
+```
+
+We have a sig. enrichment of homeostasis genes in sig. genes. This is
+shown by the p-value, but you also have to interpret the odds ratio
+correctly, to judge if there is an enrichment, or a depletion, of
+homeostasis genes in the sig. genes.
+
+### Manually calculate Odds Ratio
+
+The odds is the ratio of nr. event occurs / nr. event does not occur.
+
+**Odds of homeostasis genes in sig. genes:** nr. homeostasis genes in
+sig. genes / nr. not homoestasis genes in sig. genes.
+
+**Odds of homeostasis genes in not sig. genes:** nr. homeostasis genes
+in not sig. genes / nr. not homoestasis genes in not sig. genes.
+
+```{r}
+odds_sigG <- 47/545
+odds_notSigG <- 304/5363
+odds_sigG
+odds_notSigG
+```
+
+higher proportion of homeostasis genes in sig. genes than in not sig.
+genes.
+
+Now calculate Odds ratio
+
+if odds ratio over 1 than enrichement of geneset, if odds ratio under 1 than depletion of geneset
+
+```{r}
+odds_ratio <- odds_sigG/odds_notSigG
+odds_ratio
+```
+
+## Run over-representation analysis over different Genset collections using Bioconductor Tool Cluster Profiler
+
+### clusterProfiler needs Entrezid, or Ensemblid -\> convert symbols to Entrezid
+
+Use \# already subsetted to correct universe, to see if we can reproduce
+our finding.
+
+```{r}   
+ids <- bitr(df_DM.vs.GM.noNa$symbolmouse, 
+            fromType = "SYMBOL", 
+            toType = c("ENTREZID"), 
+            OrgDb = "org.Mm.eg.db")
+dim(df_DM.vs.GM.noNa)
+dim(ids)
+head(ids)
+
+```
+
+Some symbols did not match an Entrezid, and were dropped.
+
+Check if NA or duplicated Values.
+
+```{r}
+for(i in seq_along(ids)){
+  print(sum(duplicated(ids[, i])))
+  print(sum(is.na(ids[, i])))
+}
+```
+
+No.
+
+### Merge diff.Exp.Table with ids
+
+```{r}
+df_DM.vs.GM.noNa.m <- merge(x=df_DM.vs.GM.noNa, 
+                          y=ids, 
+                          by.x="symbolmouse", 
+                          by.y="SYMBOL", 
+                          all=F) # only keep symbols present in both tables
+dim(df_DM.vs.GM.noNa.m)
+sum(is.na(df_DM.vs.GM.noNa.m$ENTREZID))
+sum(duplicated(df_DM.vs.GM.noNa.m$ENTREZID))
+head(df_DM.vs.GM.noNa.m)
+```
+
+Looks Good, we lost some genes, but have unique Entrezid, without NA
+values.
+
+### Make vector of EntrezId from sig. genes, and from all genes (== universe)
+
+```{r}
+# extract sig. res
+df_DM.vs.GM.noNa.sig <- df_DM.vs.GM.noNa.m[df_DM.vs.GM.noNa.m$padj < 0.05 & 
+                                         abs(df_DM.vs.GM.noNa.m$log2FoldChange) > 1,  ]
+
+v_DM.vs.GM.sig <- as.character(df_DM.vs.GM.noNa.sig$ENTREZID)
+length(v_DM.vs.GM.sig)
+
+```
+
+```{r}
+# Create background dataset for hypergeometric testing using all genes tested for significance in the results
+v_DM.vs.GM.all <- as.character(df_DM.vs.GM.noNa.m$ENTREZID)
+length(v_DM.vs.GM.all)
+```
+
+### run ClusterProfiler for ORA of Reactome genesets
+
+```{r}
+r_res <- enrichPathway(gene=v_DM.vs.GM.sig, 
+                   pvalueCutoff = 0.05, 
+                   readable=TRUE, # convert EntrezId to Gene symbols in result table
+                   organism = "mouse", 
+                   universe = v_DM.vs.GM.all)
+class(r_res) # enrichResult
+```
+
+### extract all pathways
+
+```{r}
+df_res <- r_res@result
+dim(df_res)
+```
+
+### extract sig. pathways
+
+```{r}
+dim(df_res[df_res$p.adjust < 0.05, ])
+```
+
+### dataframe: only get results with sig padj \< 0.05
+
+```{r}
+df_res <- data.frame(r_res) # dataframe: only get results with sig padj < 0.05
+dim(df_res)
+```
+
+```{r}
+colnames(df_res)
+df_res
+
+df_res$oddsratio <- (as.numeric(sub("/.*", "", df_res$GeneRatio)) / as.numeric(sub(".*/", "", df_res$GeneRatio)))/(as.numeric(sub("/.*", "", df_res$BgRatio)) / as.numeric(sub(".*/", "", df_res$BgRatio)))
+
+```
+
+ClusterProfiler does not give you an odds ratio, to judge if geneset is
+enriched, or depleted. But you can calculate it by deviding GeneRation /
+BgRatio.
+
+```{r}
+map_dbl(df_res$GeneRatio, ~ eval(parse(text=.x)))/map_dbl(df_res$BgRatio, ~ eval(parse(text=.x)))
+```
+
+These were our results when we calculated it manually:
+
+```         
+ # NOPE   
+         0    1  sum
+  0   5408  350 5758
+  1    360   53  413
+  sum 5768  403 6171
+```
+
+```         
+# NOPE
+Fisher's Exact Test for Count Data
+
+data:  tab
+p-value = 1e-06
+alternative hypothesis: true odds ratio is not equal to 1
+95 percent confidence interval:
+ 1.6 3.1
+sample estimates:
+odds ratio 
+       2.3 
+```
+
+The results are a bit different. For manual calculation, we used gene
+symbols, ClusterProfiler used EntrezIds. Furthermore, we possibly used
+different versions of Reactome Database.
+
+### show sig. genes in Reactome Pathway illustration
+
+To show fold change in Reactome Pathway illustration, a vector of log2fc
+of sig. genes, with genes named by Entrezid, is needed.
+
+```{r}
+v_nam <- df_DM.vs.GM.noNa.sig$log2FoldChange
+names(v_nam) <- df_DM.vs.GM.noNa.sig$ENTREZID
+v_nam[1:4]
+```
+
+Now plot Reactome pathway Hemostasis.
+
+```{r}
+viewPathway("Activation of Matrix Metalloproteinases", 
+            readable = T, 
+            foldChange = v_nam, 
+            organism = "mouse") +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) + labs(color = "Fold Change")
+
+```
+```{r}
+viewPathway("Extracellular matrix organization", 
+            readable = T, 
+            foldChange = v_nam, 
+            organism = "mouse") +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) + labs(color = "Fold Change")
+```
+
+
+Genes up or down-regulated are indicated. Brown circles indicate genes
+not within sig. genes. Gray lines indicates known interactions.
+
+Here is how the pathway looks in Reactome pathway browser
+[pathwayBrowser](https://reactome.org/PathwayBrowser/#/R-MMU-109582).
+
+Note that some of our enriched Pathways are in the hirarchy below
+Hemostasis. So probably there are similar genes in some of the pathways.
+Plot heatmap.
+
+```{r}
+heatplot(r_res, foldChange=v_nam, showCategory=12) + scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme(axis.text.x = element_text(size = 1))
+```
+
+also plot classical Reactome pathway, and check how it looks with
+pathview
+
+```{r}
+viewPathway("Platelet calcium homeostasis", 
+            readable = T, 
+            foldChange = v_nam, 
+            organism = "mouse")
+```
+
+This is how it looks in the Reactome Pathway browser
+[link](https://reactome.org/PathwayBrowser/#/R-MMU-418346&SEL=R-MMU-418360&PATH=R-MMU-109582)
+
+
+```{r}
+save.image("RNASeq_LW_all_vs_GM_ORA")
+```
