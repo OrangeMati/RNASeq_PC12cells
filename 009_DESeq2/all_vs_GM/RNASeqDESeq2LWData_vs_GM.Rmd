@@ -1,0 +1,876 @@
+---
+title: "DESeq2_RNASeq_LWData_vs_GM"
+output: 
+  html_document:
+    #css: styles.css
+    toc: true
+    toc_depth: 4
+    number_sections: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    fig_caption: true
+    df_print: paged
+    #code_folding: hide
+    keep_md: true
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE, message = FALSE, warning=FALSE, cache=FALSE}
+# from advanced R - chapter debugging
+# options(error = function() {
+#   sink()
+#   recover()
+# })
+knitr::opts_chunk$set(cache=TRUE, 
+                      error = FALSE, 
+                      warning = FALSE, 
+                      message = FALSE, 
+                      cache.lazy = FALSE, 
+                      autodep = TRUE # automatically check if some previous chunk changed, and it TRUE, re-cache all junks from the changed chunk
+                      )
+options(rlang_trace_top_env = rlang::current_env())
+options(error = function() {
+  sink()
+  print(rlang::trace_back(bottom = sys.frame(-1)), simplify = "none")
+})
+
+library(tidyverse)
+library(data.table)
+library("DESeq2")
+library("rtracklayer")
+library("openxlsx")
+library("pheatmap")
+library(ggplot2)
+library("vsn")
+library(pheatmap)
+library("RColorBrewer")
+
+```
+
+# Overview
+
+In this analysis we will perform differential analysis using DESeq2. We
+will look in some details of DESeq2.
+
+# Read in CountTables
+
+assume you are in directory 009_DESeq2 (project folder structure
+needed), you need the following path to read in count tables:
+
+```{r}
+ct.dir <- "../../008_FeatureCountsout/ENSEMBLE/" # set input dir = counttables
+```
+
+now list files to get vector of path to count files. I have also
+unstranded und stranded counted count files in my directory, so I need
+to define that I only want to list the reverse stranded count files,
+which end with \_\_S2.
+
+```{r}
+v.f <- list.files(path = ct.dir, 
+                  pattern = "__S2$", 
+                  full.names = T) # full path to Count tables
+
+# Identify the indices of files 4, 5, and 6 for GMSM (would be 7,8,9 for HC)
+indices <- c(4, 5, 6) # i want GMSM in the first columns! as my reference for analysis 1                       # later for the second analysis i want HC as my reference 
+
+# Order the files in v.f (see comments above)
+v.f <- c(v.f[indices], v.f[-indices])
+
+rm(indices)
+v.f
+```
+
+extract short name from file -\> will be used as new column name in
+count table
+
+```{r}
+# string modification to extract the phenotype (inkl. nr. of biological replicate)
+v.n <- gsub("_S1099.._1_SE__S2", "", 
+            gsub("../../008_FeatureCountsout/ENSEMBLE//BSF_1140_HNJ5KBBXY_1#", "", v.f))
+
+```
+
+create emtpy list for for-loop
+
+```{r}
+l.f <- vector(mode = "list", 
+              length = 0)
+```
+
+read in count tables, subset to EnsembleIds and Counts, make named
+vector
+
+```{r}
+for (i in seq_along(v.f)){
+  df <- read.table(v.f[i], sep = "\t", header = T)[, c(1, 7)]
+  v <- df[, 2]
+  names(v) <- df[, 1]
+  l.f[[v.n[i]]] <- v
+}
+
+# after this the variable df remains from the last file (not needed, can be ignored, the loop processed each file (sample) and cached the sample data in df until the next file was processed, so basically just needed for processing)
+# l.f is needed!! here the values for each file (samples are stored)
+```
+
+l.f is list of integer vectors
+
+convert list to data.frame, and then to matrix
+
+```{r}
+# here the list is converted to different data type, information is unchanged
+
+df.c <- data.frame(l.f)
+
+# convert df to matrix
+m.c <- as.matrix(df.c)
+# head = show first lines for quick consistency check (subsequently used)
+head(m.c)
+```
+
+# create different tables for summarized experiment object
+
+Here is how a summarized experiment object looks like
+![link](https://www.researchgate.net/profile/Pascal-Martin-6/publication/274256021/figure/fig3/AS:294713816043527@1447276657416/Structure-of-summarizedExperiment-objects.png)
+
+## Create colData Table for Summarized experiment object
+
+colData Table contains metadata of samples, e.g. genotype, batch, cell
+type, ...\
+rownames of colData must be equal to colnames of assay (=count-) table
+
+```{r}
+
+# grouping of biological replicates of the same phenotypes
+
+df.m <- data.frame(geno=substr(v.n, start = 1, stop = 2), row.names = v.n)
+```
+
+Define reference level of genotype -\> important, because base level of
+GLM will be reference level of genotype, and comparisions will be
+relative to reference level.
+
+```{r}
+# define ref. level the order of the level should be adapted for second analysis with HC
+# as the reference (just to make sure to not mix something up) plus additional levels
+# for the apropriate OA phenotypes e.g. OA1/OA2/OA3
+df.m$geno <- factor(df.m$geno, levels = c("GM", "DM", "HC", "OA"))
+```
+
+## Create rowData Table for Summarized experiment Object
+
+### import and subset GTF file to columns you want to have in rowData
+
+This is the GTF file we used also for mapping. So identifiers in count
+table and GTF file fit together.\
+e.g. gene symbol, ensemble gene id, ....
+
+```{r}
+# GTF file used for STAR aligner, change if analysis is performed with the data from Star and feature counts made with RefSeq genome
+gm <- readGFFAsGRanges("/home/fhwn.ac.at/201138/RNASeq_LW/000_referenceseq/ENSEMBL/Rattus_norvegicus.mRatBN7.2.109.gtf")
+gm
+```
+
+gm is a GRanges Object. We want to extract only rows with type ==
+"gene". (introns are not interesting)
+
+```{r}
+gm <- gm[gm$type == "gene"] 
+```
+
+keep only colums which are not NA. With mcols you access the data.frame
+that is next to the ranges columns.
+
+```{r}
+# this part somehow performs data munging of the genome annotation
+# hard to understand since the genome annotation has a complicated format
+# mainly: this code keeps the important stuff and deletes the rest from the genome 
+# annotation for rattus norvegicus
+meta.keep <- apply(mcols(gm), 2, function(x) sum(!is.na(x)) > 0) 
+
+mcols(gm) <- mcols(gm)[, meta.keep] # subset colnames of mcols of gr
+```
+
+add rownames to GRanges Object.
+
+```{r}
+names(gm) <- gm$gene_id
+```
+
+subset to genes present in both, count table and annotation
+
+```{r}
+gm <- gm[gm$gene_id %in% rownames(df.c)] 
+```
+
+match gm and df_ct by EnsembleId
+
+```{r}
+df.c <- df.c[match(gm$gene_id, rownames(df.c)),]
+identical(gm$gene_id, rownames(df.c)) # check if order in EnsembleId is 
+# this should output TRUE
+```
+
+# make SummarizedExperiment Object and save as RDS file
+
+```{r}
+e <- SummarizedExperiment(rowRanges = gm, assays = list("counts" = m.c), 
+                          colData = df.m )
+e
+
+colnames(e)
+colData(e)
+saveRDS(e, "e_summExp.rds")
+```
+
+# make Deseq2 Object
+
+```{r}
+dds <- DESeqDataSet(e, design = ~ geno)
+dds
+```
+
+# remove genes which have zero counts for all sample
+
+```{r}
+dds <- dds[ rowSums( counts(dds) ) > 0 , ]
+class(dds)
+```
+
+# run DESeq : Modeling counts against genotype
+
+```{r}
+dds <- DESeq(dds)
+class(dds)
+```
+
+this function performed the following steps:
+
+-   estimate size factors
+
+-   estimate gene-wise dispersion
+
+-   fit curve to gene-wise disperation estimates
+
+-   shrink gene-wise dispersion estimates
+
+-   GLM fit for each gene
+
+take a detailed look at each of this steps
+[linkToHbc](https://hbctraining.github.io/DGE_workshop/lessons/04_DGE_DESeq2_analysis.html)
+
+## some additional comments on estimating size factors
+
+Check the size factors
+
+```{r}
+sizeFactors(dds)
+```
+
+Take a look at the total number of reads for each sample
+
+```{r}
+colSums(counts(dds))
+```
+
+How do the numbers correlate with the size factor?
+
+-   the smaller the total number of reads, the smaller the library sizes
+
+Now take a look at the total depth after normalization using:
+
+```{r}
+colSums(counts(dds, normalized=T))
+```
+
+Normalized reads are obtained by dividing the total reads by the size
+factors
+
+```{r}
+colSums(counts(dds))/sizeFactors(dds)
+```
+
+## some additional comments on estimating gene-wise dispersion
+
+try to plot mean count vs. variance counts
+[link](https://avikarn.com/2020-07-02-RNAseq_DeSeq2/)
+
+```{r modeldispersion, dev = "pdf"}
+# Calculating mean for each gene
+mean_readCounts <- apply(m.c[,1:3], 1, mean) #change [,1:3] to columns you want to pick
+
+# Calculating variance for each gene
+var_readCounts <- apply(m.c[,1:3], 1, var) #here too, in this exp. only for GMSM1-GMSM3
+
+df <- data.frame(mean_readCounts, var_readCounts)
+
+ggplot(df) +
+  geom_point(aes(x=mean_readCounts, y= var_readCounts)) +
+  scale_y_log10() +
+  scale_x_log10() +
+  xlab("Mean counts per gene") +
+  ylab("Variance per gene") +
+  labs(title = "DESeq2 model - Dispersion")
+```
+
+## some additional comments on fitting a curve to gene-wise disperation estimates
+
+```{r genewisedispersion, dev = c("pdf")}
+plotDispEsts(dds)
+
+```
+
+# Extract Results
+
+The model coefficients returned can be obtained like this:
+
+```{r}
+resultsNames(dds)
+```
+
+The result function is used to extract the estimated coefficients. We
+need to pass the name of the comparison from which we want to get the
+results, and the significance level (alpha defines how the "independent
+filtering" of lowly expressed genes will work).
+
+```{r}
+res.DM.vs.GM <- results(dds, name = "geno_DM_vs_GM", alpha = 0.05)
+
+```
+
+```{r}
+res.HC.vs.GM <- results(dds, name = "geno_HC_vs_GM", alpha = 0.05)
+```
+
+```{r}
+res.OA.vs.GM <- results(dds, name = "geno_OA_vs_GM", alpha = 0.05)
+```
+
+remove values where padjust or pvalue == NA
+
+```{r}
+res.DM.vs.GM.noNa <- res.DM.vs.GM[!is.na(res.DM.vs.GM$pvalue) | !is.na(res.DM.vs.GM$padj), ]
+
+```
+
+```{r}
+res.HC.vs.GM.noNa <- res.HC.vs.GM[!is.na(res.HC.vs.GM$pvalue) | !is.na(res.HC.vs.GM$padj), ]
+```
+
+```{r}
+res.OA.vs.GM.noNa <- res.OA.vs.GM[!is.na(res.OA.vs.GM$pvalue) | !is.na(res.OA.vs.GM$padj), ]
+```
+
+order values by p values
+
+```{r}
+res.DM.vs.GM.noNaOrd <- res.DM.vs.GM.noNa[order(res.DM.vs.GM.noNa$pvalue), ]
+head(res.DM.vs.GM.noNaOrd, n=4)
+
+```
+
+```{r}
+res.HC.vs.GM.noNaOrd <- res.HC.vs.GM.noNa[order(res.HC.vs.GM.noNa$pvalue), ]
+head(res.HC.vs.GM.noNaOrd, n=4)
+```
+
+```{r}
+res.OA.vs.GM.noNaOrd <- res.OA.vs.GM.noNa[order(res.OA.vs.GM.noNa$pvalue), ]
+head(res.OA.vs.GM.noNaOrd, n=4)
+```
+
+show nr. sig. genes
+
+```{r}
+summary(res.DM.vs.GM)
+
+```
+
+```{r}
+summary(res.HC.vs.GM)
+```
+
+```{r}
+summary(res.OA.vs.GM)
+```
+
+# add shrinked log2FC to result tables
+
+for DM vs GMSM
+
+```{r}
+res.DM.vs.GM.lfc <- lfcShrink(dds, coef = "geno_DM_vs_GM",  type="apeglm")
+dge <- cbind(res.DM.vs.GM.lfc, 
+                          "stat"=res.DM.vs.GM$stat, 
+             "lfcSE_not_shrunk" = res.DM.vs.GM$lfcSE, 
+             "log2FoldChange_not_shrunk" = res.DM.vs.GM$log2FoldChange)
+df_res.DM.vs.GM <- as.data.frame(dge)
+df_res.DM.vs.GM$symbol <- rowData(dds)$gene_name
+df_res.DM.vs.GM <- df_res.DM.vs.GM[, c("symbol", head(names(df_res.DM.vs.GM), n=-1))]
+# this will keep the ENSEMBLE IDs in the excel results table file
+df_res.DM.vs.GM$ENSEMBLEID <- rownames(df_res.DM.vs.GM)
+# order by pvalue
+df_res.DM.vs.GM <- df_res.DM.vs.GM[order(df_res.DM.vs.GM$pvalue), ]
+# remove NA from pvalue and padj
+df_res.DM.vs.GM.noNa <- df_res.DM.vs.GM[!is.na(df_res.DM.vs.GM$pvalue) & !is.na(df_res.DM.vs.GM$padj), ]
+dim(df_res.DM.vs.GM)
+dim(df_res.DM.vs.GM.noNa)
+sum(is.na(df_res.DM.vs.GM.noNa$pvalue))
+sum(duplicated(df_res.DM.vs.GM.noNa$pvalue))
+
+```
+
+```{r}
+res.HC.vs.GM.lfc <- lfcShrink(dds, coef = "geno_HC_vs_GM",  type="apeglm")
+dge <- cbind(res.HC.vs.GM.lfc, 
+                          "stat"=res.HC.vs.GM$stat, 
+             "lfcSE_not_shrunk" = res.HC.vs.GM$lfcSE, 
+             "log2FoldChange_not_shrunk" = res.HC.vs.GM$log2FoldChange)
+df_res.HC.vs.GM <- as.data.frame(dge)
+df_res.HC.vs.GM$symbol <- rowData(dds)$gene_name
+df_res.HC.vs.GM <- df_res.HC.vs.GM[, c("symbol", head(names(df_res.HC.vs.GM), n=-1))]
+# this will keep the ENSEMBLE IDs in the excel results table file
+df_res.HC.vs.GM$ENSEMBLEID <- rownames(df_res.HC.vs.GM)
+# order by pvalue
+df_res.HC.vs.GM <- df_res.HC.vs.GM[order(df_res.HC.vs.GM$pvalue), ]
+# remove NA from pvalue and padj
+df_res.HC.vs.GM.noNa <- df_res.HC.vs.GM[!is.na(df_res.HC.vs.GM$pvalue) & !is.na(df_res.HC.vs.GM$padj), ]
+dim(df_res.HC.vs.GM)
+dim(df_res.HC.vs.GM.noNa)
+sum(is.na(df_res.HC.vs.GM.noNa$pvalue))
+sum(duplicated(df_res.HC.vs.GM.noNa$pvalue))
+```
+
+Unclear how the duplicated stuff happens
+
+```{r}
+res.OA.vs.GM.lfc <- lfcShrink(dds, coef = "geno_OA_vs_GM",  type="apeglm")
+dge <- cbind(res.OA.vs.GM.lfc, 
+                          "stat"=res.OA.vs.GM$stat, 
+             "lfcSE_not_shrunk" = res.OA.vs.GM$lfcSE, 
+             "log2FoldChange_not_shrunk" = res.OA.vs.GM$log2FoldChange)
+df_res.OA.vs.GM <- as.data.frame(dge)
+df_res.OA.vs.GM$symbol <- rowData(dds)$gene_name
+df_res.OA.vs.GM <- df_res.OA.vs.GM[, c("symbol", head(names(df_res.OA.vs.GM), n=-1))]
+# this will keep the ENSEMBLE IDs in the excel results table file
+df_res.OA.vs.GM$ENSEMBLEID <- rownames(df_res.OA.vs.GM)
+# order by pvalue
+df_res.OA.vs.GM <- df_res.OA.vs.GM[order(df_res.OA.vs.GM$pvalue), ]
+# remove NA from pvalue and padj
+df_res.OA.vs.GM.noNa <- df_res.OA.vs.GM[!is.na(df_res.OA.vs.GM$pvalue) & !is.na(df_res.OA.vs.GM$padj), ]
+dim(df_res.OA.vs.GM)
+dim(df_res.OA.vs.GM.noNa)
+sum(is.na(df_res.OA.vs.GM.noNa$pvalue))
+sum(duplicated(df_res.OA.vs.GM.noNa$pvalue))
+```
+
+Plot histograms to visualize the p value distribution
+
+```{r}
+# added this line to visualize the p value distribution
+# literature research shows that it is quite normal for the FDR
+# to be the same for comparisons that are not significant this explains the many 
+# duplicates
+hist(df_res.DM.vs.GM$pvalue)
+hist(df_res.HC.vs.GM$pvalue)
+hist(df_res.OA.vs.GM$pvalue)
+```
+
+ignore next code block, it was commented and kept for bugfixing
+
+
+
+# write out all and subsetted results into excel file
+
+list with all (unfiltered and filtered) results
+
+```{r lastchunkchanged}
+l_df.res <- list(DM.vs.GM=df_res.DM.vs.GM,
+                 HC.vs.GM=df_res.HC.vs.GM,
+                 OA.vs.GM=df_res.OA.vs.GM)
+l_df.res.noNa <- list(DM.vs.GM.noNa=df_res.DM.vs.GM.noNa,
+                      HC.vs.GM.noNa=df_res.HC.vs.GM.noNa,
+                      OA.vs.GM.noNa=df_res.OA.vs.GM.noNa)
+
+```
+
+list with genes with sig. padj \< 0.05, separated by up and down
+
+```{r}
+# noNa.sigPadjUp
+l_df.res.noNa.sigPadjUp <- list()
+v_nam <- c("DM.vs.GM.noNa.sigPadjUp",
+           "HC.vs.GM.noNa.sigPadjUp",
+           "OA.vs.GM.noNa.sigPadjUp")
+for(i in seq_along(l_df.res.noNa)) {
+  l_df.res.noNa.sigPadjUp[[v_nam[i]]] <- l_df.res.noNa[[i]][l_df.res.noNa[[i]]$padj < 0.05 & 
+                                                              l_df.res.noNa[[i]]$log2FoldChange > 0, ]
+}
+
+# noNa.sigPadjDown
+l_df.res.noNa.sigPadjDo <- list()
+v_nam <- c("DM.vs.GM.noNa.sigPadjDo",
+           "HC.vs.GM.noNa.sigPadjDo",
+           "OA.vs.GM.noNa.sigPadjDo")
+for(i in seq_along(l_df.res.noNa)) {
+  l_df.res.noNa.sigPadjDo[[v_nam[i]]] <- l_df.res.noNa[[i]][l_df.res.noNa[[i]]$padj < 0.05 & 
+                                                              l_df.res.noNa[[i]]$log2FoldChange < 0, ]
+}
+
+
+```
+
+list with genes with sig. padj \< 0.05 & foldChange \> 2, separated by
+up and down
+
+```{r}
+# noNa.sigPadjUp
+l_df.res.noNa.sigPadjFcUp <- list()
+v_nam <- c("DM.vs.GM.noNa.sigPadjFcUp",
+           "HC.vs.GM.noNa.sigPadjFcUp",
+           "OA.vs.GM.noNa.sigPadjFcUp")
+for(i in seq_along(l_df.res.noNa)) {
+  l_df.res.noNa.sigPadjFcUp[[v_nam[i]]] <- l_df.res.noNa[[i]][l_df.res.noNa[[i]]$padj < 0.05 & 
+                                                                l_df.res.noNa[[i]]$log2FoldChange > 1, ]
+}
+
+l_df.res.noNa.sigPadjFcDo <- list()
+v_nam <- c("DM.vs.GM.noNa.sigPadjFcDo",
+           "HC.vs.GM.noNa.sigPadjFcDo",
+           "OA.vs.GM.noNa.sigPadjFcDo")
+for(i in seq_along(l_df.res.noNa)) {
+  l_df.res.noNa.sigPadjFcDo[[v_nam[i]]] <- l_df.res.noNa[[i]][l_df.res.noNa[[i]]$padj < 0.05 & 
+                                                                l_df.res.noNa[[i]]$log2FoldChange < -1, ]
+}
+
+
+```
+
+concatenate all lists, and write out
+
+```{r}
+l_df.res.all <- c(l_df.res, l_df.res.noNa, 
+                  l_df.res.noNa.sigPadjUp, 
+                  l_df.res.noNa.sigPadjDo, 
+                  l_df.res.noNa.sigPadjFcUp, 
+                  l_df.res.noNa.sigPadjFcDo)
+write.xlsx(l_df.res.all, "l_df.res.all.xlsx")
+```
+
+save RDS to read in easily for later pathway analysis
+
+```{r}
+saveRDS(l_df.res.all, "l_df.res.all.rds")
+```
+
+# visualize Results
+
+## plot MA Plot
+
+for DM vs GM
+
+```{r, fig.show="hold", out.width="50%"}
+# par(mfrow=c(2,2))
+
+plotMA(res.DM.vs.GM, ylim=c(-2,2), alpha=0.05)
+plotMA(res.DM.vs.GM.lfc, ylim=c(-2,2), alpha=0.05)
+# dev.off()
+```
+
+```{r, fig.show="hold", out.width="50%"}
+# par(mfrow=c(2,2))
+
+plotMA(res.HC.vs.GM, ylim=c(-2,2), alpha=0.05)
+plotMA(res.HC.vs.GM.lfc, ylim=c(-2,2), alpha=0.05)
+# dev.off()
+```
+
+```{r, fig.show="hold", out.width="50%"}
+# par(mfrow=c(2,2))
+
+plotMA(res.OA.vs.GM, ylim=c(-2,2), alpha=0.05)
+plotMA(res.OA.vs.GM.lfc, ylim=c(-2,2), alpha=0.05)
+# dev.off()
+```
+
+
+
+## plot normalized counts
+
+```{r, fig.show="hold", out.width="50%"}
+# par(mfrow=c(1,2))
+plotCounts(dds, gene=which.min(res.DM.vs.GM$padj), intgroup="geno") #this gene has the smallest p value
+plotCounts(dds, gene=which.min(res.HC.vs.GM$padj), intgroup="geno")
+
+plotCounts(dds, gene=which.min(res.OA.vs.GM$padj), intgroup="geno")
+#plotCounts(dds, gene=which.min(res.y.vs.c$padj), intgroup="geno")
+# dev.off()
+
+```
+
+## plot Volcano plots
+
+for DM vs GM
+
+```{r DMvsGM, fig.show="hold", out.width="50%", dev = c("pdf")}
+#reset par
+#par(mfrow=c(1,2))
+# Make a basic volcano plot
+with(res.DM.vs.GM, plot(log2FoldChange, -log10(pvalue), pch=20, main="DM.vs.GM", xlim=c(-10,10)))
+
+# Add colored points: blue if padj<0.01, red if log2FC>1 and padj<0.05)
+with(subset(res.DM.vs.GM, padj<.05 ), points(log2FoldChange, -log10(pvalue), pch=20, col="blue"))
+with(subset(res.DM.vs.GM, padj<.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(pvalue), pch=20, col="red"))
+
+#dev.off()
+```
+
+```{r HCvsGM, fig.show="hold", out.width="50%", dev = c("pdf")}
+#reset par
+#par(mfrow=c(1,2))
+# Make a basic volcano plot
+with(res.HC.vs.GM, plot(log2FoldChange, -log10(pvalue), pch=20, main="HC.vs.GM", xlim=c(-10,10)))
+
+# Add colored points: blue if padj<0.01, red if log2FC>1 and padj<0.05)
+with(subset(res.HC.vs.GM, padj<.05 ), points(log2FoldChange, -log10(pvalue), pch=20, col="blue"))
+with(subset(res.HC.vs.GM, padj<.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(pvalue), pch=20, col="red"))
+
+
+#dev.off()
+```
+
+```{r OAvsGM, fig.show="hold", out.width="50%", dev = c("pdf")}
+#reset par
+# par(mfrow=c(1,2))
+# Make a basic volcano plot
+with(res.OA.vs.GM, plot(log2FoldChange, -log10(pvalue), pch=20, main="OA.vs.GM", xlim=c(-10,10)))
+
+# Add colored points: blue if padj<0.01, red if log2FC>1 and padj<0.05)
+with(subset(res.OA.vs.GM, padj<.05 ), points(log2FoldChange, -log10(pvalue), pch=20, col="blue"))
+with(subset(res.OA.vs.GM, padj<.05 & abs(log2FoldChange)>2), points(log2FoldChange, -log10(pvalue), pch=20, col="red"))
+
+#dev.off()
+```
+
+
+
+## perform variance stabilizing transformation
+
+```{r}
+vst.b.f <- vst(dds, blind=FALSE)
+vst.b.t <- vst(dds, blind=TRUE)
+vst.b.f
+
+head(assay(vst.b.t), 3)
+```
+
+Variance stabilization shrinks standard deviation of lowly expressed
+genes.\
+It is similar, but not identical, to log transformation.\
+this gives log2(n + 1)
+
+```{r}
+ntd <- normTransform(dds)
+```
+
+now plot distribution of log2 transformed, vst transformed
+(transformatin across all samples), vst transformed (transformation
+within each group/genotype)
+
+```{r, fig.show="hold", out.width="33%"}
+# par(mfrow=c(1,4))
+meanSdPlot(assay(ntd))
+meanSdPlot(assay(vst.b.t))
+meanSdPlot(assay(vst.b.f))
+# dev.off()
+```
+
+## plot heatmap of sig. genes
+
+```{r}
+m_vst.b.f <- assay(vst.b.f)
+```
+
+### heatmap DM vs GM
+
+plot sig. genes based on padj \< 0.05 cutoff
+
+```{r}
+pheatmap(m_vst.b.f[rownames(m_vst.b.f) %in% 
+                     c(rownames(l_df.res.all$DM.vs.GM.noNa.sigPadjUp),
+                       rownames(l_df.res.all$DM.vs.GM.noNa.sigPadjDo)), 1:6], 
+         scale = "row", 
+         cluster_cols = TRUE, 
+         cluster_rows = TRUE, 
+         show_rownames = FALSE)
+```
+
+there are similar numbers of up and down, when cutoff is only padj \<
+0.05
+
+plot sig. genes based on padj \< 0.05 and foldChange \> 2 cutoff
+
+```{r}
+pheatmap(m_vst.b.f[rownames(m_vst.b.f) %in% 
+                     c(rownames(l_df.res.all$DM.vs.GM.noNa.sigPadjFcUp), 
+                     rownames(l_df.res.all$DM.vs.GM.noNa.sigPadjFcDo)), 1:6], 
+         scale = "row", 
+         cluster_cols = TRUE, 
+         cluster_rows = TRUE, 
+         show_rownames = FALSE)
+```
+
+with additional log2fc cutoff we see that there is a stronger effect on
+down-regulated genes, than on up-regulated genes
+
+#this was commented and is only used for debugging, ignore next chunk,
+
+
+
+```{r}
+'pheatmap(m_vst.b.f[rownames(m_vst.b.f) %in% 
+                     c(rownames(l_df.res.all$HC.vs.GM.noNa.sigPadjUp),
+                       rownames(l_df.res.all$HC.vs.GM.noNa.sigPadjDo)), 1:6], 
+         scale = "row", 
+         cluster_cols = TRUE, 
+         cluster_rows = TRUE, 
+         show_rownames = FALSE)'
+```
+
+
+
+### heatmap HC vs GM
+
+plot sig. genes based on padj \< 0.05 cutoff
+
+```{r}
+'pheatmap(m_vst.b.f[rownames(m_vst.b.f) %in% 
+                     c(rownames(l_df.res.all$HC.vs.GM.noNa),
+                       rownames(l_df.res.all$HC.vs.GM.noNa)), 1:6], 
+         scale = "row", 
+         cluster_cols = TRUE, 
+         cluster_rows = TRUE, 
+         show_rownames = FALSE)'
+```
+
+there are similar numbers of up and down, when cutoff is only padj \<
+0.05
+
+
+
+plot sig. genes based on padj \< 0.05 and foldChange \> 2 cutoff
+
+
+
+
+
+
+# Do some Quality Control
+
+## QC: Heatmap of the sample-to-sample distances
+
+calculate distances of samples to each other (distance matrix)
+
+```{r}
+sampleDists <- dist(t(assay(vst.b.t)))
+sampleDists
+```
+
+plot heatmap of sample distances
+
+```{r}
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- vst.b.t@colData@rownames #adds the full names
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+```
+
+## QC: Principal component plot of the samples
+
+```{r}
+plotPCA(vst.b.t, intgroup=c("geno"))
+
+```
+
+## QC: p-value distribution
+
+```{r, fig.show="hold", out.width="50%"}
+# par(mfrow=c(1, 2))
+hist(l_df.res.noNa$DM.vs.GM.noNa$pvalue, main = "p-value distribution: DM.vs.GM", xlab = NULL)
+
+# dev.off()
+```
+
+## QC: distribution of vst transformed values
+
+```{r}
+l_dens <- list()
+for(i in 1:ncol(m_vst.b.f)){
+  l_dens[[i]] <- density(m_vst.b.f[, i])
+}
+v_col <- sample(colors(), size = 8, replace = F)
+
+plot(l_dens[[1]], lwd = 2, col = "red",
+     main = "plotDensityOfDifferentSamples", xlab = "")
+for(i in 2:ncol(m_vst.b.f)){
+  lines(l_dens[[i]], col = i-1, lwd = 2)
+}
+# dev.off()
+```
+
+# Independent filtering of results
+
+
+
+```{r}
+plot(res.DM.vs.GM$baseMean+1, -log10(res.DM.vs.GM$pvalue),
+     log="x", xlab="mean of normalized counts",
+     ylab=expression(-log[10](pvalue)),
+     ylim=c(0,30),
+     cex=.4, col=rgb(0,0,0,.3))
+abline(h=-10*log10(0.05), col="red")     
+```
+
+The p-value cutoff set when calling the "results" - function is stored
+here:
+
+```{r}
+metadata(res.DM.vs.GM)$alpha
+```
+
+The thresholds set by independent filtering are stored here:
+
+```{r}
+metadata(res.DM.vs.GM)$filterThreshold
+```
+
+The 34.89% of lowest value will be filtered out from the data.\
+All genes with a mean read count \< 1.82 will be filtered out.
+
+Plot number of rejections of the Null hypothesis vs. percentiles of data
+filtered out
+
+```{r}
+plot(metadata(res.DM.vs.GM)$filterNumRej, 
+     type="b", ylab="number of rejections",
+     xlab="fractionFilteredOut")
+lines(metadata(res.DM.vs.GM)$lo.fit, col="red")
+abline(v=metadata(res.DM.vs.GM)$filterTheta)
+```
+
+rank genes by their mean of normalized counts, filter out increasing
+fraction, so starting from the most lowly expressed genes. removing the
+very lowly expressed genes at the beginning increases the number of sig.
+genes. At higher expressed genes, filtering out genes results in a
+decrease of sig. genes
+
+```{r}
+save.image("RNASeq_LW_all_vs_GM")
+```
